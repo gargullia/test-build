@@ -1,0 +1,113 @@
+name: Create Release Mediatek Filogic
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    name: "v${{ matrix.tag }} - ${{ matrix.build_env.pkgarch}} :: ${{ matrix.build_env.target}}/${{ matrix.build_env.subtarget}} build"
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        tag: ['24.10.1']
+        build_env:
+          - pkgarch: aarch64_cortex-a53
+            target: mediatek
+            subtarget: filogic
+
+    steps:
+      - name: Checkout your package repository
+        uses: actions/checkout@v4
+        with:
+          path: myrepo
+
+      - name: Checkout OpenWrt source
+        uses: actions/checkout@v4
+        with:
+          repository: openwrt/openwrt
+          ref: v${{ matrix.tag }}
+          fetch-depth: 0
+          path: openwrt
+
+      - name: Move custom packages into OpenWRT build tree
+        run: |
+          cd openwrt
+          mkdir -p package/awgopenwrt
+
+          for dir in ../myrepo/*/; do
+            [ -f "${dir}/Makefile" ] || continue
+            pkgname=$(basename "$dir")
+            echo "Copying package: $pkgname"
+            cp -r "$dir" "package/awgopenwrt/$pkgname"
+          done
+
+      - name: Setup and install feeds
+        run: |
+          cd openwrt
+
+          pkgarch=${{ matrix.build_env.pkgarch }}
+          target=${{ matrix.build_env.target }}
+          subtarget=${{ matrix.build_env.subtarget }}
+
+          rm -rf bin/packages/${pkgarch}/awgopenwrt/ || true
+          rm -rf bin/targets/${target}/${subtarget}/packages/ || true
+
+          wget https://downloads.openwrt.org/releases/${{ matrix.tag }}/targets/${target}/${subtarget}/feeds.buildinfo -O feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          wget https://downloads.openwrt.org/releases/${{ matrix.tag }}/targets/${target}/${subtarget}/config.buildinfo -O .config
+          make defconfig
+
+      - name: Enable all custom packages in .config
+        run: |
+          cd openwrt
+          for mf in package/awgopenwrt/*/Makefile; do
+            [ -f "$mf" ] || continue
+            pkg=$(grep -m1 '^define Package/' "$mf" | sed 's/define Package\///')
+            echo "CONFIG_PACKAGE_${pkg}=m" >> .config
+          done
+          make defconfig
+
+      - name: Build toolchain and kernel
+        run: |
+          cd openwrt
+          export FORCE_UNSAFE_CONFIGURE=1
+          make tools/install -i -j$(nproc)
+          make toolchain/install -i -j$(nproc)
+          make target/linux/compile -i -j$(nproc)
+
+      - name: Build all packages
+        run: |
+          cd openwrt
+          set -e
+          for mf in package/awgopenwrt/*/Makefile; do
+            [ -f "$mf" ] || continue
+            pkg=$(grep -m1 '^define Package/' "$mf" | sed 's/define Package\///')
+            echo ">> Building package: $pkg"
+            make -j1 V=sc package/${pkg}/{clean,download,prepare,compile}
+          done
+
+      - name: Prepare artifacts
+        run: |
+          cd openwrt
+          mkdir -p awgrelease
+          tag_name=${{ github.ref_name }}
+          postfix="${tag_name}_v${{ matrix.tag }}_${{ matrix.build_env.pkgarch }}_${{ matrix.build_env.target }}_${{ matrix.build_env.subtarget }}"
+          
+          for ipk in bin/packages/${{ matrix.build_env.pkgarch }}/awgopenwrt/*.ipk; do
+            name=$(basename "$ipk")
+            cp "$ipk" "awgrelease/${name%.ipk}_${postfix}.ipk"
+          done
+
+      - name: Release packages
+        uses: softprops/action-gh-release@v1
+        with:
+          files: openwrt/awgrelease/*.ipk
+
+      - name: Cleanup
+        run: |
+          rm -rf openwrt/feeds.conf openwrt/awgrelease || true
